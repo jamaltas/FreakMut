@@ -22,10 +22,6 @@ lto = "fat"       # Enable Link-Time Optimizations.
 codegen-units = 1 # Maximize optimizations across the entire crate.
 panic = "abort"   # Abort on panic for a smaller and slightly faster binary.
 
-[[bench]]
-name = "bessel_bench" # Name of your benchmark harness
-harness = false        # Tells Cargo that `criterion` will provide the main function for the bench
-
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]
 
