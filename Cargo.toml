@@ -1,0 +1,31 @@
+[package]
+name = "freakMut"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = { version = "0.16.1", features = ["rayon"] }
+csv = "1.3"
+rayon = "1.8"
+interp = "2.1.1"
+
+[dev-dependencies]
+rand = "0.8" # For generating random numbers if you prefer that over loading from file
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+# This is the "best performance for production" profile.
+# For profiling, you might keep `debug = true`. For a final build, set to false or 0.
+debug = false
+strip = true      # Automatically strip symbols from the binary.
+lto = "fat"       # Enable Link-Time Optimizations.
+codegen-units = 1 # Maximize optimizations across the entire crate.
+panic = "abort"   # Abort on panic for a smaller and slightly faster binary.
+
+[[bench]]
+name = "bessel_bench" # Name of your benchmark harness
+harness = false        # Tells Cargo that `criterion` will provide the main function for the bench
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native"]
+
