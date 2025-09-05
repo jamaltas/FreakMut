@@ -1,53 +1,59 @@
 mod bessel_functions_gsl;
 //mod bessel_functions;
 
+mod interp_zero_alloc;
+
 use bessel_functions_gsl::{bessel_i1_scaled_fast};
 //use bessel_functions::{bessel_i1e_simd};
-use interp::{interp, InterpMode};
+
+use interp_zero_alloc::{interp_zero_alloc, InterpMode};
+
+//use interp::{interp, InterpMode};
 use ndarray::{Array, Array1, ArrayView1, Array2, Array3, Axis, Zip};
 use rayon::prelude::*;
 use std::error::Error;
 use std::time::Instant;
 use std::iter;
+use fastapprox::faster;
 
 // --- Data Structures for Organization ---
 
 /// Holds all the fixed configuration parameters for the simulation.
 struct AppConfig {
-    taumin: f64,
-    taumax: f64,
-    g: f64,
-    c: f64,
-    lam: f64,
-    rd: f64,
-    smin: f64,
-    smax: f64,
-    ds: f64,
-    dtau: f64,
+    taumin: f32,
+    taumax: f32,
+    g: f32,
+    c: f32,
+    lam: f32,
+    rd: f32,
+    smin: f32,
+    smax: f32,
+    ds: f32,
+    dtau: f32,
     niter: usize,
-    adaptive_criterion: f64,
+    adaptive_criterion: f32,
 }
 
 /// Holds the computed grids for time, fitness (s), and establishment time (tau).
 struct Grids {
-    t: Array1<f64>,
-    ss: Array1<f64>,
-    taus: Array1<f64>,
+    t: Array1<f32>,
+    ss: Array1<f32>,
+    taus: Array1<f32>,
 }
 
 /// Holds pre-computed arrays that don't change during the main iteration.
 struct PrecomputedData {
-    exps: Array2<f64>,
-    logpriorm: Array1<f64>,
-    kap: Array1<f64>,
+    exps: Array2<f32>,
+    logpriorm: Array1<f32>,
+    kap: Array1<f32>,
 }
 
 /// Holds helper matrices that are re-calculated in each iteration of the main loop.
 struct HelperMatrices {
-    ee: Array2<f64>,
-    eeup: Array1<f64>,
-    bkn: Array2<f64>,
-    rmu: Array3<f64>,
+    ee: Array2<f32>,
+    eeup: Array1<f32>,
+    bkn: Array2<f32>,
+    rmu: Array3<f32>,
 }
 
 
@@ -67,32 +73,32 @@ fn setup_config() -> AppConfig {
         ds: 0.01,
         dtau: 4.0,
         niter: 5,
-        adaptive_criterion: 0.9f64.ln(),
+        adaptive_criterion: 0.9f32.ln(),
     }
 }
 
 /// Creates and returns the time and parameter grids based on the config.
 fn setup_grids(config: &AppConfig) -> Grids {
-    let t_values: Vec<f64> = (0..=config.taumax as i32)
+    let t_values: Vec<f32> = (0..=config.taumax as i32)
         .step_by(config.g as usize)
-        .map(|v| v as f64)
+        .map(|v| v as f32)
         .collect();
     let t = Array1::from_vec(t_values);
 
     let num_s_steps = ((config.smax - config.smin) / config.ds).round() as i32;
-    let ss_values: Vec<f64> = (0..=num_s_steps).map(|i| config.smin + i as f64 * config.ds).collect();
+    let ss_values: Vec<f32> = (0..=num_s_steps).map(|i| config.smin + i as f32 * config.ds).collect();
     let ss = Array1::from_vec(ss_values);
 
     let num_tau_steps = ((config.taumax - config.taumin) / config.dtau).round() as i32;
-    let taus_values: Vec<f64> = (0..=num_tau_steps).map(|i| config.taumin + i as f64 * config.dtau).collect();
+    let taus_values: Vec<f32> = (0..=num_tau_steps).map(|i| config.taumin + i as f32 * config.dtau).collect();
     let taus = Array1::from_vec(taus_values);
 
     Grids { t, ss, taus }
 }
 
 /// Pre-processes the raw read counts in-place and returns the total reads per time point.
-fn preprocess_reads(reads: &mut Array2<f64>) -> Array1<f64> {
-    let r: Array1<f64> = reads.sum_axis(Axis(0));
+fn preprocess_reads(reads: &mut Array2<f32>) -> Array1<f32> {
+    let r: Array1<f32> = reads.sum_axis(Axis(0));
     let r1_fix_factor = r[1] / r[0];
     
     let mut reads_col0 = reads.column_mut(0);
@@ -107,7 +113,7 @@ fn precompute_data(grids: &Grids, config: &AppConfig) -> PrecomputedData {
     let km = grids.t.len();
     let ls = grids.ss.len();
     
-    let mut exps = Array2::<f64>::zeros((km, ls));
+    let mut exps = Array2::<f32>::zeros((km, ls));
     for k in 1..km {
         for i in 0..ls {
             exps[[k, i]] = (grids.ss[i] * (grids.t[k] - grids.t[k - 1])).exp();
@@ -117,13 +123,13 @@ fn precompute_data(grids: &Grids, config: &AppConfig) -> PrecomputedData {
     let big_t = config.taumax - config.taumin;
     let logpriorm = grids.ss.mapv(|s| -s / config.lam + (s / (config.lam.powi(2) * big_t)).ln());
 
-    let kap = Array1::<f64>::from_elem(km, 2.5);
+    let kap = Array1::<f32>::from_elem(km, 2.5);
 
     PrecomputedData { exps, logpriorm, kap }
 }
 
 /// Calculates the initial guess for the mean fitness `sbi`.
-fn calculate_initial_sbi(reads: &Array2<f64>, grids: &Grids) -> Array1<f64> {
+fn calculate_initial_sbi(reads: &Array2<f32>, grids: &Grids) -> Array1<f32> {
     let n_lin = reads.shape()[0];
     let km = grids.t.len();
 
@@ -135,7 +141,7 @@ fn calculate_initial_sbi(reads: &Array2<f64>, grids: &Grids) -> Array1<f64> {
         .filter(|&i| first_col[i] < mean_first_col && first_col[i] > last_col[i] && last_col[i] > 1.0)
         .collect();
 
-    let mut sbi = Array1::<f64>::zeros(km);
+    let mut sbi = Array1::<f32>::zeros(km);
     if !putneut_indices.is_empty() {
         let putneut_reads = reads.select(Axis(0), &putneut_indices);
         for k in 1..km {
@@ -160,30 +166,30 @@ fn calculate_initial_sbi(reads: &Array2<f64>, grids: &Grids) -> Array1<f64> {
 
 /// Updates the set of helper matrices based on the current mean fitness `sb`.
 fn update_helper_matrices(
-    sb_x: &[f64],
-    sb_y: &[f64],
-    reads: &Array2<f64>,
+    sb_x: &[f32],
+    sb_y: &[f32],
+    reads: &Array2<f32>,
     grids: &Grids,
     config: &AppConfig,
 ) -> HelperMatrices {
-    let interp_mode = InterpMode::default();
+    let interp_mode = InterpMode::Extrapolate;
     let km = grids.t.len();
     let ls = grids.ss.len();
     let ltau = grids.taus.len();
 
     // Calculate ci
     let t_end = grids.t[km - 1];
-    let ci_vec: Vec<f64> = (0..=t_end as i32)
+    let ci_vec: Vec<f32> = (0..=t_end as i32)
         .map(|i| {
-            let upper_bound = i as f64;
+            let upper_bound = i as f32;
             let n_steps = ((upper_bound * 1000.0).ceil() as usize).max(100);
-            trapezoidal_rule(|x| interp(sb_x, sb_y, x, &interp_mode), 0.0, upper_bound, n_steps)
+            trapezoidal_rule(|x| interp_zero_alloc(sb_x, sb_y, x, &interp_mode), 0.0, upper_bound, n_steps)
         })
         .collect();
     let ci = Array1::from_vec(ci_vec);
 
     // Calculate ee
-    let mut ee = Array2::<f64>::zeros((ci.len(), ci.len()));
+    let mut ee = Array2::<f32>::zeros((ci.len(), ci.len()));
     for i in 0..ci.len() {
         for j in 0..ci.len() {
             ee[[i, j]] = (ci[i] - ci[j]).exp();
@@ -196,25 +202,27 @@ fn update_helper_matrices(
     let eeup = Array1::from_vec(eeup_vec);
 
     // Calculate bkn
-    let mut eer = Array2::<f64>::zeros((km, km));
+    let mut eer = Array2::<f32>::zeros((km, km));
     for k in 0..km { eer[[k, k]] = 1.0; }
     for k in 1..km { eer[[k - 1, k]] = eeup[k]; }
     let bkn = reads.dot(&eer);
 
     // Calculate rmu
-    let mut rmu = Array3::<f64>::zeros((km, ls, ltau));
-    for k in 1..km {
-        let tk_minus_1 = grids.t[k - 1];
-        for i in 0..ls {
-            let s = grids.ss[i];
-            for j in 0..ltau {
-                let tau = grids.taus[j];
+    let mut rmu = Array3::<f32>::zeros((ls, ltau, km));
+    for i in 0..ls {
+        let s = grids.ss[i];
+        for j in 0..ltau {
+            let tau = grids.taus[j];
+            let sb_tau = interp_zero_alloc(sb_x, sb_y, tau, &interp_mode);
+            let denominator = (s - sb_tau).max(0.005);
+            let ee_idx_tau = tau.max(0.0) as usize;
+
+            for k in 1..km {
+                let tk_minus_1 = grids.t[k - 1];
                 if tk_minus_1 >= tau {
-                    let sb_tau = interp(sb_x, sb_y, tau, &interp_mode);
-                    let denominator = (s - sb_tau).max(0.005);
-                    let ee_idx_tau = tau.max(0.0) as usize;
                     let ee_val = ee[[ee_idx_tau, tk_minus_1 as usize]];
-                    rmu[[k, i, j]] = (config.rd / config.g) * config.c / denominator * ee_val * (s * (tk_minus_1 - tau)).exp();
+                    // Note the new index order [i, j, k]
+                    rmu[[i, j, k]] = (config.rd / config.g) * config.c / denominator * ee_val * (s * (tk_minus_1 - tau)).exp();
                 }
             }
         }
@@ -223,31 +231,27 @@ fn update_helper_matrices(
     HelperMatrices { ee, eeup, bkn, rmu }
 }
 
-thread_local! {
-    static BK_SCRATCH_BUFFER: std::cell::RefCell<Vec<f64>> = std::cell::RefCell::new(Vec::new());
-}
-
 /// Estimates the fitness `s` and establishment time `tau` for each lineage in parallel.
 fn estimate_mutations_for_lineages(
-    reads: &Array2<f64>,
+    reads: &Array2<f32>,
     grids: &Grids,
     config: &AppConfig,
     precomputed: &PrecomputedData,
     helpers: &HelperMatrices,
-) -> Array2<f64> {
+) -> Array2<f32> {
     let n_lin = reads.shape()[0];
     let ls = grids.ss.len();
     let ltau = grids.taus.len();
 
-    let muti_rows: Vec<(f64, f64)> = (0..n_lin)
+    let muti_rows: Vec<(f32, f32)> = (0..n_lin)
         .into_par_iter()
         //.into_iter()
         .map(|l| {
-            let mut log_f = Array2::<f64>::zeros((ls, ltau));
+            let mut log_f = Array2::<f32>::zeros((ls, ltau));
             for i in 0..ls {
                 for j in 0..ltau {
-                    //log_f[[i, j]] = logp_a(l, i, j, reads, &precomputed.kap, &precomputed.exps, &helpers.rmu, &helpers.eeup, &precomputed.logpriorm);
-                    log_f[[i, j]] = logp_a_vectorizd(l, i, j, reads, &precomputed.kap, &precomputed.exps, &helpers.rmu, &helpers.eeup, &precomputed.logpriorm);
+                    log_f[[i, j]] = logp_a(l, i, j, reads, &precomputed.kap, &precomputed.exps, &helpers.rmu, &helpers.eeup, &precomputed.logpriorm);
+                    //log_f[[i, j]] = logp_a_vectorizd(l, i, j, reads, &precomputed.kap, &precomputed.exps, &helpers.rmu, &helpers.eeup, &precomputed.logpriorm);
                 }
             }
             
@@ -265,7 +269,7 @@ fn estimate_mutations_for_lineages(
         })
         .collect();
 
-    let mut muti = Array2::<f64>::zeros((n_lin, 2));
+    let mut muti = Array2::<f32>::zeros((n_lin, 2));
     for (l, (s_val, tau_val)) in muti_rows.into_iter().enumerate() {
         muti[[l, 0]] = s_val;
         muti[[l, 1]] = tau_val;
@@ -275,26 +279,26 @@ fn estimate_mutations_for_lineages(
 
 /// Updates the mean fitness `sbi` based on the latest mutation estimates.
 fn update_mean_fitness(
-    muti: &Array2<f64>,
-    sb_x: &[f64],
-    sb_y: &[f64],
-    reads: &Array2<f64>,
-    r: &Array1<f64>,
+    muti: &Array2<f32>,
+    sb_x: &[f32],
+    sb_y: &[f32],
+    reads: &Array2<f32>,
+    r: &Array1<f32>,
     grids: &Grids,
     config: &AppConfig,
     helpers: &HelperMatrices,
-) -> Array1<f64> {
+) -> Array1<f32> {
     let n_lin = reads.shape()[0];
     let km = grids.t.len();
-    let interp_mode = InterpMode::default();
+    let interp_mode = InterpMode::Extrapolate;
 
     let mut new_sbi = Array1::zeros(km);
     for k in 1..km {
-        let sbi_k_numerator: f64 = (0..n_lin).into_par_iter().map(|l| {
+        let sbi_k_numerator: f32 = (0..n_lin).into_par_iter().map(|l| {
             let s = muti[[l, 0]];
             let tau = muti[[l, 1]];
-            if s > 0.0 {
-                let sb_tau = interp(sb_x, sb_y, tau, &interp_mode);
+            if s > 0.0 && grids.t[k] > tau {
+                let sb_tau = interp_zero_alloc(sb_x, sb_y, tau, &interp_mode);
                 let nmut1 = config.c / (s - sb_tau).max(0.005)
                     * helpers.ee[[(tau.max(0.0)) as usize, grids.t[k] as usize]]
                     * (s * (grids.t[k] - tau)).exp();
@@ -324,9 +328,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let initial_sbi = calculate_initial_sbi(&reads, &grids);
 
     // --- 2. Main Iterative Algorithm ---
-    let mut sbmat = Array2::<f64>::zeros((config.niter, grids.t.len()));
-    let mut sb_x: Vec<f64> = std::iter::once(config.taumin).chain(grids.t.iter().cloned()).collect();
-    let mut sb_y: Vec<f64> = std::iter::once(0.0).chain(initial_sbi.iter().cloned()).collect();
+    let mut sbmat = Array2::<f32>::zeros((config.niter, grids.t.len()));
+    let mut sb_x: Vec<f32> = std::iter::once(config.taumin).chain(grids.t.iter().cloned()).collect();
+    let mut sb_y: Vec<f32> = std::iter::once(0.0).chain(initial_sbi.iter().cloned()).collect();
 
     for iter in 0..config.niter {
         let t1 = Instant::now();
@@ -358,13 +362,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 // --- Helper and Bayesian Functions  ---
 
-fn read_csv_to_ndarray(filepath: &str) -> Result<Array2<f64>, Box<dyn Error>> {
+fn read_csv_to_ndarray(filepath: &str) -> Result<Array2<f32>, Box<dyn Error>> {
     let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_path(filepath)?;
     let mut records = Vec::new();
     let mut ncols = 0;
     for result in rdr.records() {
         let record = result?;
-        let row: Vec<f64> = record.iter().map(|s| s.parse().unwrap()).collect();
+        let row: Vec<f32> = record.iter().map(|s| s.parse().unwrap()).collect();
         if ncols == 0 { ncols = row.len(); }
         records.extend_from_slice(&row);
     }
@@ -372,23 +376,23 @@ fn read_csv_to_ndarray(filepath: &str) -> Result<Array2<f64>, Box<dyn Error>> {
     Ok(Array::from_shape_vec((nrows, ncols), records)?)
 }
 
-fn logsumexp<I: Iterator<Item = f64>>(iter: I) -> f64 {
-    let vec: Vec<f64> = iter.collect();
-    if vec.is_empty() { return f64::NEG_INFINITY; }
-    let max_val = vec.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+fn logsumexp<I: Iterator<Item = f32>>(iter: I) -> f32 {
+    let vec: Vec<f32> = iter.collect();
+    if vec.is_empty() { return f32::NEG_INFINITY; }
+    let max_val = vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     if max_val.is_infinite() { return max_val; }
-    let sum = vec.iter().map(|&x| (x - max_val).exp()).sum::<f64>();
+    let sum = vec.iter().map(|&x| (x - max_val).exp()).sum::<f32>();
     max_val + sum.ln()
 }
 
-fn argmax_2d(arr: &Array2<f64>) -> (usize, usize) {
+fn argmax_2d(arr: &Array2<f32>) -> (usize, usize) {
     arr.indexed_iter()
        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
        .map(|(index, _)| index) 
        .unwrap_or((0, 0))
 }
 
-fn median(data: &mut [f64]) -> f64 {
+fn median(data: &mut [f32]) -> f32 {
     data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = data.len() / 2;
     if data.len() % 2 == 0 {
@@ -398,65 +402,66 @@ fn median(data: &mut [f64]) -> f64 {
     }
 }
 
-fn trapezoidal_rule<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
+fn trapezoidal_rule<F: Fn(f32) -> f32>(f: F, a: f32, b: f32, n: usize) -> f32 {
     if (a - b).abs() < 1e-9 { return 0.0; }
-    let h = (b - a) / (n as f64);
+    let h = (b - a) / (n as f32);
     let mut sum = 0.5 * (f(a) + f(b));
     for i in 1..n {
-        let x = a + (i as f64) * h;
+        let x = a + (i as f32) * h;
         sum += f(x);
     }
     sum * h
 }
 
-fn bk_a(l: usize, k: usize, i: usize, j: usize, reads: &Array2<f64>, exps: &Array2<f64>, rmu: &Array3<f64>, eeup: &Array1<f64>) -> f64 {
+fn bk_a(l: usize, k: usize, i: usize, j: usize, reads: &Array2<f32>, exps: &Array2<f32>, rmu: &Array3<f32>, eeup: &Array1<f32>) -> f32 {
+    
     let reads_lk_minus_1 = reads[[l, k - 1]];
-    let rmu_val = rmu[[k, i, j]];
+    let rmu_val = rmu[[i, j, k]]; 
     (reads_lk_minus_1 - (1.0 - exps[[k, i]]) * rmu_val.min(reads_lk_minus_1)) * eeup[k]
 }
 
-
-fn logexpi(r: f64, bk: f64, kappa: f64) -> f64 {
+#[inline(always)]
+fn logexpi(r: f32, bk: f32, kappa: f32) -> f32 {
     let x = 2.0 * (r * bk).sqrt() / kappa;
     let bessel_term = bessel_i1_scaled_fast(x);
-    -(kappa * (1.0 - (-bk / kappa).exp())).ln() + 0.5 * (bk / r).ln() - (r + bk) / kappa + bessel_term.ln() + x
+
+    -faster::ln(kappa * (1.0 - faster::exp(-bk / kappa))) 
+    + 0.5 * faster::ln(bk / r) 
+    - (r + bk) / kappa 
+    + faster::ln(bessel_term) 
+    + x
 }
 
-fn logexpi_vectorized(r_vals: ArrayView1<f64>, bk_vals: ArrayView1<f64>, kaps: ArrayView1<f64>) -> f64 {
-    
-    let xs = 2.0 * ((&r_vals * &bk_vals).sqrt() / &kaps);
-
-    // if I can vectorize this with SIMD, then we're cruising.
-    //let bessel_terms: Vec<f64> = xs.clone().into_iter().map(bessel_i1_scaled_fast).collect();
-    let bessel_terms = xs.mapv(bessel_i1_scaled_fast);
-   
-
+fn logexpi_vectorized(r_vals: ArrayView1<f32>, bk_vals: ArrayView1<f32>, kaps: ArrayView1<f32>) -> f32 {
     let mut sum = 0.0;
 
-    // Zip up all the input arrays needed for the calculation.
+    // Use Zip to iterate over the input arrays only
     Zip::from(&r_vals)
         .and(&bk_vals)
         .and(&kaps)
-        .and(&bessel_terms)
-        .and(&xs)
-        // .for_each() executes a closure for each element set. It returns ().
-        .for_each(|&r, &bk, &kappa, &bes, &x| {
-            // This is the body of our single, fused loop.
-            // Calculate the term for the current set of elements...
-            let term = -(kappa * (1.0 - (-bk / kappa).exp())).ln()
-                     + 0.5 * (bk / r).ln()
+        // This closure will be executed for each element set in parallel
+        .for_each(|&r, &bk, &kappa| {
+            // Calculate 'x' for the current element directly
+            let x  = 2.0 * ((r * bk).sqrt() / kappa);
+
+            // Calculate 'bes' (bessel_terms) for the current element directly
+            let bes = bessel_i1_scaled_fast(x);
+
+            // Calculate the 'term' for the current element
+            let term = -faster::ln(kappa * (1.0 - faster::exp(-bk / kappa)))
+                     + 0.5 * faster::ln(bk / r)
                      - (r + bk) / kappa
-                     + bes.ln()
+                     + faster::ln(bes)
                      + x;
-            // ...and add it to our accumulator.
+
+            // Add to the sum. Rayon handles atomic summing for parallel for_each.
             sum += term;
         });
 
     sum
-
 }
 
-fn logp_n(l: usize, reads: &Array2<f64>, bkn: &Array2<f64>, kap: &Array1<f64>) -> f64 {
+fn logp_n(l: usize, reads: &Array2<f32>, bkn: &Array2<f32>, kap: &Array1<f32>) -> f32 {
     let km = reads.shape()[1];
     (0..km).map(|k| {
         let r_val = reads[[l, k]];
@@ -465,20 +470,26 @@ fn logp_n(l: usize, reads: &Array2<f64>, bkn: &Array2<f64>, kap: &Array1<f64>) -
     }).sum()
 }
 
-/*
-fn logp_a(l: usize, i: usize, j: usize, reads: &Array2<f64>, kap: &Array1<f64>, exps: &Array2<f64>, rmu: &Array3<f64>, eeup: &Array1<f64>, logpriorm: &Array1<f64>) -> f64 {
+
+fn logp_a(l: usize, i: usize, j: usize, reads: &Array2<f32>, kap: &Array1<f32>, exps: &Array2<f32>, rmu: &Array3<f32>, eeup: &Array1<f32>, logpriorm: &Array1<f32>) -> f32 {
     let km = reads.shape()[1];
     let mut logp = logpriorm[i];
-    for k in 0..km {
-        let r_val = reads[[l, k]];
-        let bk_val = if k == 0 { r_val } else { bk_a(l, k, i, j, reads, exps, rmu, eeup) };
+    let r_vals = reads.row(l);
+
+    // Handle k=0 case
+    logp += logexpi(r_vals[0], r_vals[0], kap[0]);
+    
+    // Loop for k > 0
+    for k in 1..km {
+        let r_val = r_vals[k];
+        let bk_val = bk_a(l, k, i, j, reads, exps, rmu, eeup);
         logp += logexpi(r_val, bk_val, kap[k]);
     }
     logp
 }
-*/
 
-fn logp_a_vectorizd(l: usize, i: usize, j: usize, reads: &Array2<f64>, kap: &Array1<f64>, exps: &Array2<f64>, rmu: &Array3<f64>, eeup: &Array1<f64>, logpriorm: &Array1<f64>) -> f64 {
+
+fn logp_a_vectorizd(l: usize, i: usize, j: usize, reads: &Array2<f32>, kap: &Array1<f32>, exps: &Array2<f32>, rmu: &Array3<f32>, eeup: &Array1<f32>, logpriorm: &Array1<f32>) -> f32 {
     let km = reads.shape()[1];
     let mut logp = logpriorm[i];
 
@@ -492,7 +503,7 @@ fn logp_a_vectorizd(l: usize, i: usize, j: usize, reads: &Array2<f64>, kap: &Arr
         .chain((1..km).map(|k| bk_a(l, k, i, j, reads, exps, rmu, eeup)));
 
     // Collect the complete iterator directly into a new Array1
-    let bk_vals: Array1<f64> = bk_vals_iter.collect();
+    let bk_vals: Array1<f32> = bk_vals_iter.collect();
 
     logp += logexpi_vectorized(r_vals_view.view(), bk_vals.view(), kap.view());
 

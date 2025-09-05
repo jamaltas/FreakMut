@@ -6,20 +6,20 @@
 
 pub struct ChebSeries {
     /// Coefficients
-    pub c: &'static [f64],
+    pub c: &'static [f32],
     /// Order of expansion
     pub order: usize,
     /// Lower interval point
-    pub a: f64,
+    pub a: f32,
     /// Upper interval point
-    pub b: f64,
+    pub b: f32,
 }
 
 // --- Optimized Chebyshev Evaluation Function ---
 
 /// Evaluates a Chebyshev series, optimized for speed by removing error calculation.
 #[inline(always)]
-fn cheb_eval_fast(cs: &ChebSeries, x: f64) -> f64 {
+fn cheb_eval_fast(cs: &ChebSeries, x: f32) -> f32 {
     let mut d = 0.0;
     let mut dd = 0.0;
 
@@ -58,7 +58,7 @@ fn cheb_eval_fast(cs: &ChebSeries, x: f64) -> f64 {
 // --- Static Data for Chebyshev Expansions ---
 // (This data remains identical to the original)
 
-static BI1_DATA: [f64; 11] = [
+static BI1_DATA: [f32; 11] = [
     -0.001971713261099859, 0.407348876675464810, 0.034838994299959456,
     0.001545394556300123, 0.000041888521098377, 0.000000764902676483,
     0.000000010042493924, 0.000000000099322077, 0.000000000000766380,
@@ -66,7 +66,7 @@ static BI1_DATA: [f64; 11] = [
 ];
 static BI1_CS: ChebSeries = ChebSeries { c: &BI1_DATA, order: 10, a: -1.0, b: 1.0 };
 
-static AI1_DATA: [f64; 21] = [
+static AI1_DATA: [f32; 21] = [
     -0.02846744181881479, -0.01922953231443221, -0.00061151858579437,
     -0.00002069971253350, 0.00000858561914581, 0.00000104949824671,
     -0.00000029183389184, -0.00000001559378146, 0.00000001318012367,
@@ -77,7 +77,7 @@ static AI1_DATA: [f64; 21] = [
 ];
 static AI1_CS: ChebSeries = ChebSeries { c: &AI1_DATA, order: 20, a: -1.0, b: 1.0 };
 
-static AI12_DATA: [f64; 22] = [
+static AI12_DATA: [f32; 22] = [
     0.02857623501828014, -0.00976109749136147, -0.00011058893876263,
     -0.00000388256480887, -0.00000025122362377, -0.00000002631468847,
     -0.00000000383538039, -0.00000000055897433, -0.00000000001897495,
@@ -93,7 +93,7 @@ static AI12_CS: ChebSeries = ChebSeries { c: &AI12_DATA, order: 21, a: -1.0, b: 
 
 // Pre-calculated coefficients for the polynomial in 1/z
 // P(w) = 1 + c1*w + c2*w^2 + c3*w^3 + ...
-static P_COEFFS: [f64; 8] = [
+static P_COEFFS: [f32; 8] = [
     -3.0 / 8.0,                     // -0.375
     -15.0 / 128.0,                  // -0.1171875
     315.0 / 1024.0,                 //  0.3076171875
@@ -106,18 +106,18 @@ static P_COEFFS: [f64; 8] = [
 
 
 // --- Constants ---
-const ROOT_EIGHT: f64 = 2.0 * std::f64::consts::SQRT_2;
-const EPSILON_SQRT: f64 = 1.4901161193847656e-08; // sqrt(f64::EPSILON)
-const LOG_DBL_MAX: f64 = 709.782712893384; // f64::MAX.ln()
-const FRAC_1_SQRT_2PI: f64 = 0.398942280401432677939946059934381868_f64;
+const ROOT_EIGHT: f32 = 2.0 * std::f32::consts::SQRT_2;
+const EPSILON_SQRT: f32 = 1.4901161193847656e-08; // sqrt(f32::EPSILON)
+const LOG_DBL_MAX: f32 = 709.782712893384; // f32::MAX.ln()
+const FRAC_1_SQRT_2PI: f32 = 0.398942280401432677939946059934381868_f32;
 
 
 /// Computes e^(-|x|) * I_1(x), optimized for speed.
 /// Panics on underflow.
 #[inline(always)] 
-pub fn bessel_i1_scaled_fast(x: f64) -> f64 {
-    const X_MIN: f64 = 2.0 * f64::MIN_POSITIVE;
-    const X_SMALL: f64 = ROOT_EIGHT * EPSILON_SQRT;
+pub fn bessel_i1_scaled_fast(x: f32) -> f32 {
+    const X_MIN: f32 = 2.0 * f32::MIN_POSITIVE;
+    const X_SMALL: f32 = ROOT_EIGHT * EPSILON_SQRT;
 
     if x > 25.0 {
         i1e_asymptotic(x)
@@ -155,9 +155,9 @@ pub fn bessel_i1_scaled_fast(x: f64) -> f64 {
 /// Computes I_1(x), optimized for speed.
 /// Panics on underflow and `inf` on overflow.
 #[allow(dead_code)]
-pub fn bessel_i1_fast(x: f64) -> f64 {
-    const X_MIN: f64 = 2.0 * f64::MIN_POSITIVE;
-    const X_SMALL: f64 = ROOT_EIGHT * EPSILON_SQRT;
+pub fn bessel_i1_fast(x: f32) -> f32 {
+    const X_MIN: f32 = 2.0 * f32::MIN_POSITIVE;
+    const X_SMALL: f32 = ROOT_EIGHT * EPSILON_SQRT;
 
     let y = x.abs();
 
@@ -180,9 +180,9 @@ pub fn bessel_i1_fast(x: f64) -> f64 {
 }
 
 #[inline(always)]
-fn i1e_asymptotic(z: f64) -> f64 {
+fn i1e_asymptotic(z: f32) -> f32 {
     // This is 1/sqrt(2*pi)
-    const INV_SQRT_2PI: f64 = FRAC_1_SQRT_2PI;
+    const INV_SQRT_2PI: f32 = FRAC_1_SQRT_2PI;
 
     let z_inv = 1.0 / z;
     
