@@ -3,6 +3,7 @@
 
 /// Represents a Chebyshev series for function approximation.
 /// This is the Rust equivalent of `cheb_series_struct`.
+
 pub struct ChebSeries {
     /// Coefficients
     pub c: &'static [f64],
@@ -88,42 +89,61 @@ static AI12_DATA: [f64; 22] = [
 ];
 static AI12_CS: ChebSeries = ChebSeries { c: &AI12_DATA, order: 21, a: -1.0, b: 1.0 };
 
+// --- NEW: Asymptotic series calculation for large x ---
+
+// Pre-calculated coefficients for the polynomial in 1/z
+// P(w) = 1 + c1*w + c2*w^2 + c3*w^3 + ...
+static P_COEFFS: [f64; 8] = [
+    -3.0 / 8.0,                     // -0.375
+    -15.0 / 128.0,                  // -0.1171875
+    315.0 / 1024.0,                 //  0.3076171875
+    -12285.0 / 32768.0,              // -0.37493896484375
+    8591985.0 / 8388608.0,           //  1.024245262145996
+    -851968065.0 / 268435456.0,      // -3.1737537384033203
+    126938965875.0 / 10737418240.0,  // 11.822203063964844
+    -2975473763325.0 / 549755813888.0 // -5.412351226806641
+];
+
 
 // --- Constants ---
 const ROOT_EIGHT: f64 = 2.0 * std::f64::consts::SQRT_2;
 const EPSILON_SQRT: f64 = 1.4901161193847656e-08; // sqrt(f64::EPSILON)
 const LOG_DBL_MAX: f64 = 709.782712893384; // f64::MAX.ln()
+const FRAC_1_SQRT_2PI: f64 = 0.398942280401432677939946059934381868_f64;
 
 
 /// Computes e^(-|x|) * I_1(x), optimized for speed.
 /// Panics on underflow.
+#[inline(always)] 
 pub fn bessel_i1_scaled_fast(x: f64) -> f64 {
     const X_MIN: f64 = 2.0 * f64::MIN_POSITIVE;
     const X_SMALL: f64 = ROOT_EIGHT * EPSILON_SQRT;
 
-    let y = x.abs();
-
-
-    if y > X_SMALL {
-        if y <= 3.0 {
-            let ey = (-y).exp();
-            let c_val = cheb_eval_fast(&BI1_CS, y * y / 4.5 - 1.0);
-            x * ey * (0.875 + c_val)
-        } else if y <= 8.0 {
-            let sy = y.sqrt();
-            let c_val = cheb_eval_fast(&AI1_CS, (48.0 / y - 11.0) / 5.0);
-            let b = (0.375 + c_val) / sy;
-            b.copysign(x)
-        } else { // y > 8.0
-            let sy = y.sqrt();
-            let c_val = cheb_eval_fast(&AI12_CS, 16.0 / y - 1.0);
-            let b = (0.375 + c_val) / sy;
-            b.copysign(x)
-        }
-    } else { // less likely paths, requires very small values < 4.21 e-8
-        if y == 0.0 {
+    if x > 25.0 {
+        i1e_asymptotic(x)
+    } else if x > 8.0 {
+        // This is the HOT PATH, executed ~98.4% of the time.
+        let sy = x.sqrt();
+        let c_val = cheb_eval_fast(&AI12_CS, 16.0 / x - 1.0);
+        let b = (0.375 + c_val) / sy;
+        b
+    } else if x > 3.0 {
+        // This path covers the (3.0, 8.0] range.
+        let sy = x.sqrt();
+        let c_val = cheb_eval_fast(&AI1_CS, (48.0 / x - 11.0) / 5.0);
+        let b = (0.375 + c_val) / sy;
+        b
+    } else if x > X_SMALL {
+        // This path covers the (X_SMALL, 3.0] range.
+        let ey = (-x).exp();
+        let c_val = cheb_eval_fast(&BI1_CS, x * x / 4.5 - 1.0);
+        let b = x * ey * (0.875 + c_val);
+        b
+    } else { 
+        // These are the COLD PATHS for extremely small or zero inputs.
+        if x == 0.0 {
             0.0
-        } else if y < X_MIN {
+        } else if x < X_MIN {
             panic!("Underflow, bessel function samples with too small a value.")
         } else {
             0.5 * x
@@ -157,4 +177,23 @@ pub fn bessel_i1_fast(x: f64) -> f64 {
     } else {
         panic!("Overflow, bessel function samples with too large a value.")
     }
+}
+
+#[inline(always)]
+fn i1e_asymptotic(z: f64) -> f64 {
+    // This is 1/sqrt(2*pi)
+    const INV_SQRT_2PI: f64 = FRAC_1_SQRT_2PI;
+
+    let z_inv = 1.0 / z;
+    
+    // Evaluate the polynomial in 1/z using Horner's method for efficiency and accuracy
+    // P(w) = 1 + w*c1 + w^2*c2 + ... = 1 + w*(c1 + w*(c2 + ...))
+    let mut poly = 0.0;
+    // Iterate backwards over the coefficients
+    for &coeff in P_COEFFS.iter().rev() {
+        poly = poly * z_inv + coeff;
+    }
+    poly = 1.0 + z_inv * poly;
+
+    INV_SQRT_2PI * z.sqrt().recip() * poly
 }

@@ -4,7 +4,7 @@ mod bessel_functions_gsl;
 use bessel_functions_gsl::{bessel_i1_scaled_fast};
 //use bessel_functions::{bessel_i1e_simd};
 use interp::{interp, InterpMode};
-use ndarray::{Array, Array1, ArrayView1, Array2, Array3, Axis, Zip};
+use ndarray::{s, Array, Array1, ArrayView1, Array2, Array3, ArrayView3, Array4, Axis, Zip};
 use rayon::prelude::*;
 use std::error::Error;
 use std::time::Instant;
@@ -155,6 +155,46 @@ fn calculate_initial_sbi(reads: &Array2<f64>, grids: &Grids) -> Array1<f64> {
     sbi
 }
 
+/// Pre-computes the bk_a values for all lineages, times, fitnesses, and taus.
+fn precompute_bk_a(
+    reads: &Array2<f64>,
+    precomputed: &PrecomputedData,
+    helpers: &HelperMatrices,
+) -> Array4<f64> {
+    let n_lin = reads.shape()[0];
+    let km = reads.shape()[1];
+    let ls = precomputed.exps.shape()[1];
+    let ltau = helpers.rmu.shape()[2];
+
+    let mut bk_a_precomputed = Array4::<f64>::zeros((n_lin, km, ls, ltau));
+
+    bk_a_precomputed.axis_iter_mut(Axis(0))
+        .into_iter()
+        .enumerate()
+        .for_each(|(l, mut bk_a_slice_l)| {
+            let mut k0_slice = bk_a_slice_l.slice_mut(s![0, .., ..]);
+            k0_slice.fill(reads[[l, 0]]);
+            // ------------------------------------------
+
+            // Now, compute the rest for k > 0
+            for k in 1..km {
+                for i in 0..ls {
+                    for j in 0..ltau {
+                        let reads_lk_minus_1 = reads[[l, k - 1]];
+                        let rmu_val = helpers.rmu[[k, i, j]];
+                        
+                        let val = (reads_lk_minus_1 - (1.0 - precomputed.exps[[k, i]]) * rmu_val.min(reads_lk_minus_1)) 
+                                  * helpers.eeup[k];
+
+                        bk_a_slice_l[[k, i, j]] = val;
+                    }
+                }
+            }
+        });
+
+    bk_a_precomputed
+}
+
 
 // --- Main Algorithm Functions ---
 
@@ -234,6 +274,7 @@ fn estimate_mutations_for_lineages(
     config: &AppConfig,
     precomputed: &PrecomputedData,
     helpers: &HelperMatrices,
+    bk_a_precomputed: &Array4<f64>,
 ) -> Array2<f64> {
     let n_lin = reads.shape()[0];
     let ls = grids.ss.len();
@@ -241,15 +282,9 @@ fn estimate_mutations_for_lineages(
 
     let muti_rows: Vec<(f64, f64)> = (0..n_lin)
         .into_par_iter()
-        //.into_iter()
         .map(|l| {
             let mut log_f = Array2::<f64>::zeros((ls, ltau));
-            for i in 0..ls {
-                for j in 0..ltau {
-                    //log_f[[i, j]] = logp_a(l, i, j, reads, &precomputed.kap, &precomputed.exps, &helpers.rmu, &helpers.eeup, &precomputed.logpriorm);
-                    log_f[[i, j]] = logp_a_vectorizd(l, i, j, reads, &precomputed.kap, &precomputed.exps, &helpers.rmu, &helpers.eeup, &precomputed.logpriorm);
-                }
-            }
+            let log_f = logp_a_vectorizd_all(l, reads, &precomputed.kap, &bk_a_precomputed, &precomputed.logpriorm);
             
             let pra = logsumexp(log_f.iter().cloned()) + (config.ds * config.dtau).ln();
             let prn = logp_n(l, reads, &helpers.bkn, &precomputed.kap);
@@ -335,13 +370,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         // --- 2a. Update helper matrices based on current `sb` ---
         let helpers = update_helper_matrices(&sb_x, &sb_y, &reads, &grids, &config);
 
-        // --- 2b. Estimate `s` and `tau` for each lineage ---
-        let muti = estimate_mutations_for_lineages(&reads, &grids, &config, &precomputed, &helpers);
+        // --- 2b. Precompute bk_a values ---
+        let bk_a_precomputed = precompute_bk_a(&reads, &precomputed, &helpers);
 
-        // --- 2c. Update mean fitness `sb` using new estimates ---
+        // --- 2c. Estimate `s` and `tau` for each lineage ---
+        let muti = estimate_mutations_for_lineages(&reads, &grids, &config, &precomputed, &helpers, &bk_a_precomputed);
+
+        // --- 2d. Update mean fitness `sb` using new estimates ---
         let new_sbi = update_mean_fitness(&muti, &sb_x, &sb_y, &reads, &r, &grids, &config, &helpers);
         
-        // --- 2d. Store results and update state for next iteration ---
+        // --- 2e. Store results and update state for next iteration ---
         sbmat.row_mut(iter).assign(&new_sbi);
         sb_x = std::iter::once(config.taumin).chain(grids.t.iter().cloned()).collect();
         sb_y = std::iter::once(0.0).chain(new_sbi.iter().cloned()).collect();
@@ -417,8 +455,11 @@ fn bk_a(l: usize, k: usize, i: usize, j: usize, reads: &Array2<f64>, exps: &Arra
 
 
 fn logexpi(r: f64, bk: f64, kappa: f64) -> f64 {
+
     let x = 2.0 * (r * bk).sqrt() / kappa;
-    let bessel_term = bessel_i1_scaled_fast(x);
+
+    let bessel_term = bessel_i1_scaled_fast(x as f64) as f64;
+
     -(kappa * (1.0 - (-bk / kappa).exp())).ln() + 0.5 * (bk / r).ln() - (r + bk) / kappa + bessel_term.ln() + x
 }
 
@@ -429,7 +470,6 @@ fn logexpi_vectorized(r_vals: ArrayView1<f64>, bk_vals: ArrayView1<f64>, kaps: A
     // if I can vectorize this with SIMD, then we're cruising.
     //let bessel_terms: Vec<f64> = xs.clone().into_iter().map(bessel_i1_scaled_fast).collect();
     let bessel_terms = xs.mapv(bessel_i1_scaled_fast);
-   
 
     let mut sum = 0.0;
 
@@ -456,6 +496,42 @@ fn logexpi_vectorized(r_vals: ArrayView1<f64>, bk_vals: ArrayView1<f64>, kaps: A
 
 }
 
+fn logexpi_vectorized_all(r_vals: ArrayView1<f64>, bk_vals: ArrayView3<f64>, kaps: ArrayView1<f64>) -> Array2<f64> {
+    
+    let ls = bk_vals.shape()[1];
+    let ltau = bk_vals.shape()[2];
+
+    // The only allocation. This will be our `sum` array.
+    let mut log_likelihood_2d = Array2::<f64>::zeros((ls, ltau));
+
+    // Outer loop over 'k'.
+    for k in 0..r_vals.len() {
+        let r_k = r_vals[k];
+        let kap_k = kaps[k];
+        let bk_slice_2d = bk_vals.slice(s![k, .., ..]);
+
+        // This Zip iterates over the (i, j) dimensions.
+        Zip::from(&mut log_likelihood_2d)
+            .and(&bk_slice_2d)
+            .for_each(|ll_val, &bk_val| {
+                // --- Perform the calculation directly ---
+                // This might produce NaN or -inf if inputs are zero or negative.
+                let x = 2.0 * (r_k * bk_val).sqrt() / kap_k;
+                let bessel_term = bessel_i1_scaled_fast(x);
+
+                let term = -(kap_k * (1.0 - (-bk_val / kap_k).exp())).ln()
+                           + 0.5 * (bk_val / r_k).ln()
+                           - (r_k + bk_val) / kap_k
+                           + bessel_term.ln()
+                           + x;
+                           
+                *ll_val +=  term;
+            });
+    }
+    
+    log_likelihood_2d // This is the final summed array
+}
+
 fn logp_n(l: usize, reads: &Array2<f64>, bkn: &Array2<f64>, kap: &Array1<f64>) -> f64 {
     let km = reads.shape()[1];
     (0..km).map(|k| {
@@ -478,23 +554,47 @@ fn logp_a(l: usize, i: usize, j: usize, reads: &Array2<f64>, kap: &Array1<f64>, 
 }
 */
 
-fn logp_a_vectorizd(l: usize, i: usize, j: usize, reads: &Array2<f64>, kap: &Array1<f64>, exps: &Array2<f64>, rmu: &Array3<f64>, eeup: &Array1<f64>, logpriorm: &Array1<f64>) -> f64 {
-    let km = reads.shape()[1];
+fn logp_a_vectorizd(
+    l: usize, 
+    i: usize, 
+    j: usize, 
+    reads: &Array2<f64>, 
+    kap: &Array1<f64>, 
+    bk_a_precomputed: &Array4<f64>, 
+    logpriorm: &Array1<f64>
+) -> f64 {
     let mut logp = logpriorm[i];
+    let r_vals_view = reads.row(l);
+
+    // Just take a single, clean slice from the precomputed array.
+    // This slice represents all `k` values for the given l, i, and j.
+    // This is a view, so it's zero-cost.
+    let bk_vals_view = bk_a_precomputed.slice(s![l, .., i, j]);
+
+    // Pass the views directly.
+    logp += logexpi_vectorized(r_vals_view, bk_vals_view, kap.view());
+
+    logp
+}
+
+fn logp_a_vectorizd_all(
+    l: usize, 
+    reads: &Array2<f64>, 
+    kap: &Array1<f64>, 
+    bk_a_precomputed: &Array4<f64>, 
+    logpriorm: &Array1<f64>
+) -> Array2<f64> {
 
     let r_vals_view = reads.row(l);
 
-    // Get the first value
-    let bk_first = r_vals_view[0];
+    // Just take a single, clean slice from the precomputed array.
+    // This slice represents all `k` values for the given l, i, and j.
+    // This is a view, so it's zero-cost.
+    let bk_vals_view = bk_a_precomputed.slice(s![l, .., .., ..]);
 
-    // Create an iterator that yields the first value, then all subsequent values
-    let bk_vals_iter = iter::once(bk_first)
-        .chain((1..km).map(|k| bk_a(l, k, i, j, reads, exps, rmu, eeup)));
+    // Pass the views directly.
+    let log_liklihood = logexpi_vectorized_all(r_vals_view, bk_vals_view, kap.view());
+    let log_f = log_liklihood + &logpriorm.clone().insert_axis(Axis(1));
 
-    // Collect the complete iterator directly into a new Array1
-    let bk_vals: Array1<f64> = bk_vals_iter.collect();
-
-    logp += logexpi_vectorized(r_vals_view.view(), bk_vals.view(), kap.view());
-
-    logp
+    log_f
 }

@@ -100,6 +100,9 @@ fn chbevl<const N: usize>(x: f64, coeffs: &[f64; N]) -> f64 {
     0.5 * (b0 - b2)
 }
 
+
+//pub fn bessel_i1e_simd(xs: Vec<f64>) ->  {}
+
 // --- Exponentially Scaled Modified Bessel Function (Translated from i1e.c) ---
 
 /// Calculates the exponentially scaled modified Bessel function of the first kind
@@ -143,6 +146,7 @@ pub fn i1e(x: f64) -> f64 {
 ///
 /// # Returns
 /// The value of I_1(x).
+#[allow(dead_code)]
 pub fn i1(x: f64) -> f64 {
     let z = x.abs(); 
 
